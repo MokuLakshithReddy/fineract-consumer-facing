@@ -1,0 +1,237 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Real end-to-end journeys across the whole stack: the built Angular app (nginx), the BFF, Fineract,
+# both PostgreSQL databases, Valkey and Mailpit, from docker-compose.e2e.yml. Nothing is mocked; see
+# docs/frontend/development/build-and-test.adoc ("Full-stack journeys").
+#
+# Stack combinations:
+#   pull requests and main  Fineract pinned in consumer/compose.yaml, BFF on the JVM
+#   nightly                 additionally Fineract `develop` (does upstream still work with us?)
+#                           and the BFF as the GraalVM native image
+#   manual dispatch         any one combination
+name: Full-Stack E2E
+
+on:
+  pull_request:
+    paths:
+      - 'frontend/**'
+      - 'consumer/**'
+      - 'docker-compose.e2e.yml'
+      - 'docker-compose.e2e.native.yml'
+      - '.github/workflows/e2e-full-stack.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'consumer/**'
+      - 'docker-compose.e2e.yml'
+      - 'docker-compose.e2e.native.yml'
+      - '.github/workflows/e2e-full-stack.yml'
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      fineract:
+        description: 'Fineract image: "pinned" (consumer/compose.yaml) or an apache/fineract tag such as "develop"'
+        default: pinned
+        type: string
+      bff:
+        description: BFF runtime
+        default: jvm
+        type: choice
+        options: [jvm, native]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    name: Choose stack combinations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Build the matrix
+        id: matrix
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_FINERACT: ${{ inputs.fineract }}
+          INPUT_BFF: ${{ inputs.bff }}
+        run: |
+          case "$EVENT" in
+            schedule)
+              matrix='[{"fineract":"pinned","bff":"jvm"},{"fineract":"develop","bff":"jvm"},{"fineract":"pinned","bff":"native"}]' ;;
+            workflow_dispatch)
+              if ! [[ "$INPUT_FINERACT" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                echo "::error::Invalid Fineract image tag: $INPUT_FINERACT"; exit 1
+              fi
+              matrix=$(jq -cn --arg f "$INPUT_FINERACT" --arg b "$INPUT_BFF" '[{fineract:$f,bff:$b}]') ;;
+            *)
+              matrix='[{"fineract":"pinned","bff":"jvm"}]' ;;
+          esac
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  journeys:
+    name: Journeys (Fineract ${{ matrix.fineract }}, BFF ${{ matrix.bff }})
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      # Empty selects the tag pinned in consumer/compose.yaml.
+      FINERACT_IMAGE_TAG: ${{ matrix.fineract != 'pinned' && matrix.fineract || '' }}
+      COMPOSE_FILES: ${{ matrix.bff == 'native' && '-f docker-compose.e2e.yml -f docker-compose.e2e.native.yml' || '-f docker-compose.e2e.yml' }}
+      CI: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Set up JDK 25
+        if: matrix.bff == 'jvm'
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: '25'
+          distribution: 'zulu'
+
+      - name: Set up GraalVM 25
+        if: matrix.bff == 'native'
+        uses: graalvm/setup-graalvm@27b360dbb857524eaf0b4c4cef364d38e5b4f173 # v1.6.7
+        with:
+          java-version: '25'
+          distribution: 'graalvm-community'
+
+      - name: Setup Gradle and Validate Wrapper
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          validate-wrappers: true
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Read Playwright version
+        id: pw-version
+        working-directory: frontend
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+
+      - name: Install Playwright browsers (cache miss)
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Playwright system deps (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        working-directory: frontend
+        run: npx playwright install-deps chromium
+
+      - name: Generate dev JWT signing key
+        working-directory: consumer
+        run: ./scripts/generate-dev-jwt-key.sh
+
+      - name: Pre-create JaCoCo mount directories
+        run: mkdir -p consumer/build/jacoco-agent consumer/build/jacoco
+
+      # Same split as build-native.yml: native-image peaks around 8 GiB, and a Gradle process keeps the
+      # heap it grew into, so generation and AOT run in one process and the image is built in another.
+      - name: Generate, compile and AOT-process (native)
+        if: matrix.bff == 'native'
+        working-directory: consumer
+        run: ./gradlew --no-daemon -Pnative aotClasses jar generateResourcesConfigFile
+
+      - name: Compile native image (native)
+        if: matrix.bff == 'native'
+        working-directory: consumer
+        env:
+          NATIVE_IMAGE_OPTIONS: -J-Xmx9g
+        run: ./gradlew --no-daemon -Dorg.gradle.jvmargs=-Xmx2g -Pnative nativeCompile
+
+      - name: Start the backend
+        run: docker compose $COMPOSE_FILES up -d --build --wait --wait-timeout 600 bff
+
+      # The frontend image builds the app against the TypeScript client generated from the running BFF.
+      - name: Generate the BFF client
+        working-directory: frontend
+        run: npm run generate:client
+
+      - name: Start the frontend
+        run: docker compose $COMPOSE_FILES up -d --build --wait --wait-timeout 300
+
+      - name: Record the stack under test
+        run: |
+          {
+            echo "### Stack under test"
+            echo ""
+            echo "| Service | Image |"
+            echo "|---|---|"
+            docker compose $COMPOSE_FILES ps --format '| {{.Service}} | {{.Image}} |'
+            echo ""
+            echo "Fineract build: $(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$(docker compose $COMPOSE_FILES ps -q fineract)" 2>/dev/null || true)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the full-stack journeys
+        working-directory: frontend
+        run: npm run e2e:full-stack
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose $COMPOSE_FILES logs --no-color
+
+      - name: Tear down the stack
+        if: always()
+        run: docker compose $COMPOSE_FILES down -v
+
+      - name: Upload the Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: full-stack-report-${{ matrix.fineract }}-${{ matrix.bff }}
+          path: frontend/playwright-report/full-stack
+          retention-days: 14
+
+      - name: Upload traces and videos on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: full-stack-test-results-${{ matrix.fineract }}-${{ matrix.bff }}
+          path: frontend/test-results/full-stack
+          retention-days: 14

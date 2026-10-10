@@ -25,6 +25,8 @@ Every script in `frontend/package.json`:
 | `generate:jwt-key` | Runs `consumer/scripts/generate-dev-jwt-key.sh` to create the dev JWT signing key.
 | `e2e` | `playwright test`: runs the Playwright specs against an already-running stack.
 | `e2e:ui` | `playwright test --ui`: the same specs in Playwright's interactive UI mode.
+| `e2e:full-stack` | The full-stack journeys (`playwright.full-stack.config.ts`) against an already-running stack; nothing is mocked.
+| `e2e:full-stack:ui` | The same journeys in Playwright's interactive UI mode.
 | `e2e:docker:up:backend` | Generates the JWT key, then starts only the `bff` service (and its dependencies) from `docker-compose.e2e.yml`.
 | `e2e:docker:up` | Backend up, regenerate the TypeScript client, then build and start the full stack including the frontend container.
 | `e2e:docker:down` | `docker compose down -v`: removes containers and volumes for a clean next start.
@@ -85,6 +87,70 @@ npm run e2e:stack:run
 ----
 
 To iterate on specs, run `npm run e2e:docker:up` once and then `npm run e2e` (or `npm run e2e:ui`) repeatedly, tearing down with `npm run e2e:docker:down` when finished.
+
+=== Full-stack journeys
+
+The specs above check the app in isolation. The journeys in `frontend/playwright/full-stack/` check that it works with the real BFF, Fineract and email delivery. They run against the same stack with nothing mocked, configured by `playwright.full-stack.config.ts`, and `npm run e2e:stack:run` runs both suites.
+
+Each test starts from nothing and builds its own consumer the way the product does:
+
+. *Staff set-up in Fineract.* `support/fineract.ts` calls Fineract's REST API as the default `mifos` user (port 8888). It creates an active client with an SSN identifier, two USD savings accounts (one funded with 5,000), and a disbursed 10,000 loan, mirroring the Cucumber suite's `FineractSeeder`. If the tenant has no `SSN` document type under `Customer Identifier`, it adds one, because the registration form offers SSN and Aadhaar.
+. *Self-registration in the app.* The test fills in the registration wizard and confirms it with the OTP emailed to the consumer.
+. *Multi-factor sign-in.* The test signs in with the password and the emailed second factor.
+
+Every OTP is read from Mailpit, the SMTP sink in the stack (port 8025), by `support/mailpit.ts`. The BFF keeps one pending OTP per user, so a test clears the consumer's inbox before each action that sends a code.
+
+[cols="1,3"]
+|===
+|Spec |Journeys
+
+|`auth.spec.ts`
+|Register and sign in with the second factor, sign out, and be redirected from a protected page. A wrong password and a wrong code are refused. Reset a forgotten password with an emailed code and sign in with it.
+
+|`accounts.spec.ts`
+|The summary lists the accounts opened in Fineract; a savings account shows its balance and the deposit transaction; a loan shows its disbursal.
+
+|`beneficiaries.spec.ts`
+|Add, rename and delete a beneficiary, each change confirmed by OTP; adding one of your own accounts is refused.
+
+|`transfers.spec.ts`
+|Transfer between your own accounts, and pay a beneficiary within its limit. A payment above the limit is refused. Balances are checked in Fineract, not only on screen.
+
+|`loans.spec.ts`
+|Preview a schedule, submit an application and withdraw it (with the status checked in Fineract); repay a loan from savings with an OTP.
+
+|`profile-settings.spec.ts`
+|The profile shows the registered client; change the password with an OTP and sign in with the new one; no connected apps for a new consumer.
+
+|`audit.spec.ts`
+|The audit trail records the sign-in; another customer's account is refused; the side menu and the language switcher work.
+|===
+
+Tests are independent: each seeds its own client, so they can run in any order or alone. Two Ionic details matter when you write a new one, and `support/ionic.ts` handles both:
+
+* An `<ion-button>` with `routerLink` renders as a link, so look it up with `action()` rather than `getByRole('button')`.
+* Selects open in an overlay attached to `<body>`. Use `select()`.
+
+To iterate, bring the stack up once with `npm run e2e:docker:up`, then run `npm run e2e:full-stack` (or `e2e:full-stack:ui`). The service URLs default to the compose ports; override them with `PLAYWRIGHT_BASE_URL`, `FINERACT_API_URL` and `MAILPIT_URL`. CI runs the journeys in their own workflow, `e2e-full-stack.yml`, which builds and starts the whole stack for each combination it tests:
+
+[cols="1,1,1"]
+|===
+|When |Fineract |BFF
+
+|Pull requests and pushes to `main`
+|The image pinned in `consumer/compose.yaml`
+|JVM jar
+
+|Nightly
+|Pinned, and `develop` (an early warning when upstream changes break the BFF)
+|JVM jar, and the GraalVM native image (with the pinned Fineract)
+
+|Manual dispatch
+|Any `apache/fineract` tag
+|Either
+|===
+
+Each run records the images under test in the job summary and keeps the HTML report. On failure it also keeps the traces, videos and container logs. The native variant layers `docker-compose.e2e.native.yml` onto the e2e stack; it builds the binary first, as `build-native.yml` does.
 
 == Regenerating the TypeScript client
 
