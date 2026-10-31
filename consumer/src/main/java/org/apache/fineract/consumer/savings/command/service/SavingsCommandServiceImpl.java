@@ -20,7 +20,7 @@
 package org.apache.fineract.consumer.savings.command.service;
 
 import java.time.LocalDate;
-import java.time.ZoneOffset;
+import java.time.ZoneId;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
@@ -66,6 +66,9 @@ public class SavingsCommandServiceImpl implements SavingsCommandService {
     @Value("${consumer.savings.command.allowed-product-ids:}")
     private Set<Long> allowedProductIds;
 
+    @Value("${fineract.client.tenant-time-zone:UTC}")
+    private ZoneId tenantTimeZone;
+
     private final UserQueryService userQueryService;
     private final AccessPolicyEvaluator accessPolicyEvaluator;
     private final OwnedAccountsCache ownedAccountsCache;
@@ -77,7 +80,7 @@ public class SavingsCommandServiceImpl implements SavingsCommandService {
         accessPolicyEvaluator.authorize(jwt, ConsumerAction.SAVINGS_APPLICATION_SUBMIT);
         validateProductAllowList(command.getProductId());
         Long clientId = resolveClientId(jwt);
-        LocalDate submittedOnDate = LocalDate.now(ZoneOffset.UTC);
+        LocalDate submittedOnDate = LocalDate.now(tenantTimeZone);
         PostSavingsAccountsRequest request = buildSubmitRequest(command, clientId, submittedOnDate);
         PostSavingsAccountsResponse response = callWithIdempotency(jwt, command.getIdempotencyKey(),
                 () -> savingsAccountApiClient.submitSavingsApplication(request));
@@ -96,7 +99,7 @@ public class SavingsCommandServiceImpl implements SavingsCommandService {
         validateProductAllowList(command.getProductId());
         validateSavingsDepositType(command.getSavingsId());
         Long clientId = resolveClientId(jwt);
-        LocalDate submittedOnDate = LocalDate.now(ZoneOffset.UTC);
+        LocalDate submittedOnDate = LocalDate.now(tenantTimeZone);
         PutSavingsAccountsAccountIdRequest request = buildModifyRequest(command, submittedOnDate);
         PutSavingsAccountsAccountIdResponse response = callWithIdempotency(jwt, command.getIdempotencyKey(),
                 () -> savingsAccountApiClient.updateSavingsAccount(command.getSavingsId(), request, null));
@@ -113,7 +116,7 @@ public class SavingsCommandServiceImpl implements SavingsCommandService {
                 SavingsCommandAccessDeniedException::new);
         validateSavingsDepositType(command.getSavingsId());
         Long clientId = resolveClientId(jwt);
-        LocalDate withdrawnOnDate = LocalDate.now(ZoneOffset.UTC);
+        LocalDate withdrawnOnDate = LocalDate.now(tenantTimeZone);
         PostSavingsAccountsAccountIdRequest request = new PostSavingsAccountsAccountIdRequest()
                 .withdrawnOnDate(withdrawnOnDate.toString())
                 .note(command.getNote())
@@ -186,3 +189,4 @@ public class SavingsCommandServiceImpl implements SavingsCommandService {
                 .locale(LOCALE);
     }
 }
+
